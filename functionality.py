@@ -76,12 +76,17 @@ LOSS_REGISTRY: Dict[str, Callable] = {
 # ===================================================================
 # 2.  LOCAL PAIRWISE LOSS-DIFFERENTIAL MODEL  (Richter–Smetanina style)
 # ===================================================================
+import numpy as np
+from typing import Tuple, Optional
+from dataclasses import dataclass
+
+EPS = 1e-10
 
 # ---------- kernel ----------
 
 def epanechnikov_kernel(u: np.ndarray) -> np.ndarray:
-    """Epanechnikov kernel  K(u) = 0.75*(1-u^2)  for |u|<=1, else 0."""
-    w = np.zeros_like(u)
+    """Epanechnikov kernel K(u) = 0.75*(1-u^2) for |u|<=1, else 0."""
+    w = np.zeros_like(u, dtype=float)
     mask = np.abs(u) <= 1.0
     w[mask] = 0.75 * (1.0 - u[mask] ** 2)
     return w
@@ -95,13 +100,13 @@ def _build_ar_design(series: np.ndarray, d: int) -> Tuple[np.ndarray, np.ndarray
 
     Returns
     -------
-    Y : shape (n-d,)
-    X : shape (n-d, d+1)   columns = [1, lag1, lag2, ..., lag_d]
+    Y : shape (T-d,)
+    X : shape (T-d, d+1)   columns = [1, lag1, ..., lag_d]
     """
     n = len(series)
     if n <= d:
         raise ValueError("Series too short for AR({})".format(d))
-    Y = series[d:]
+    Y = series[d:].copy()
     X = np.ones((n - d, d + 1))
     for k in range(1, d + 1):
         X[:, k] = series[d - k: n - k]
@@ -113,51 +118,107 @@ def local_linear_ar_fit(
     d: int,
     h: float,
     target_frac: float = 1.0,
+    t_filter: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Local linear AR(d) fit at rescaled time *target_frac* (in [0,1]).
+    Local linear AR(d) fit at rescaled time *target_frac*.
 
-    Uses Epanechnikov kernel centred at *target_frac* with bandwidth *h*.
+    Builds the augmented Z_t(u) = [X_{t-1}, (t/T - u)*X_{t-1}] design
+    matrix (size 2*(d+1)) as in equation (3) of the paper, estimates
+    theta(u) via WLS, and returns the first (d+1) components as rho(u).
 
     Parameters
     ----------
-    series : 1-d array of length T
-    d      : AR lag order
-    h      : bandwidth (on the [0,1] scale)
-    target_frac : point at which to localise (usually T/T = 1.0 for forecasting)
+    series      : 1-d array of length T
+    d           : AR lag order
+    h           : bandwidth on [0,1] scale
+    target_frac : evaluation point u (usually 1.0 for forecasting)
+    t_filter    : optional array of length T; 0 = exclude, 1 = include.
+                  Applied to the (T-d) observation rows after lag truncation.
 
     Returns
     -------
-    beta  : estimated local AR coefficients  (d+1,)
-    resid : weighted residuals              (n,)
-    W_diag: kernel weights                   (n,)
+    beta    : rho(u) estimate, shape (d+1,)  [first half of theta(u)]
+    resid   : Y - X @ beta, shape (T-d,)
+    W_diag  : kernel weights, shape (T-d,)
     """
     Y, X = _build_ar_design(series, d)
-    n = len(Y)
-    fracs = (np.arange(d, d + n) + 1) / (d + n)  # rescaled times for each obs
+    n = len(Y)  # = T - d
+    T = len(series)
+
+    # rescaled time for each observation row (index d, d+1, ..., T-1)
+    fracs = np.arange(d, T) / T
+
+    # kernel weights centred at target_frac
     u = (fracs - target_frac) / max(h, EPS)
     W_diag = epanechnikov_kernel(u)
 
-    # Weighted least squares
-    Ws = np.sqrt(W_diag + EPS)
-    Xw = X * Ws[:, None]
-    Yw = Y * Ws
+    # apply t_filter if supplied (operates on the post-lag rows)
+    if t_filter is not None:
+        W_diag = W_diag * t_filter[d:]
+
+    # build augmented local linear design matrix Z_t(u) of size (n, 2*(d+1))
+    # top block: X  (the standard AR regressors)
+    # bottom block: (t/T - u) * X  (local linear expansion)
+    delta = (fracs - target_frac)[:, None]   # shape (n, 1)
+    X_ll = X * delta                          # (t/T - u) * X, shape (n, d+1)
+    Z = np.hstack([X, X_ll])                  # shape (n, 2*(d+1))
+
+    # WLS: (Z'WZ)^{-1} Z'WY  where W = diag(W_diag)
+    ZW = Z * W_diag[:, None]                  # row-wise kernel weighting
+    ZWZ = ZW.T @ Z                            # shape (2*(d+1), 2*(d+1))
+    ZWY = ZW.T @ Y                            # shape (2*(d+1),)
+
     try:
-        beta, _, _, _ = np.linalg.lstsq(Xw, Yw, rcond=None)
-    except LinAlgError:
-        beta = np.zeros(d + 1)
+        theta = np.linalg.solve(ZWZ, ZWY)
+    except np.linalg.LinAlgError:
+        theta = np.zeros(2 * (d + 1))
+
+    # rho(u) is the first (d+1) components of theta
+    beta = theta[:d + 1]
     resid = Y - X @ beta
     return beta, resid, W_diag
 
 
+def _estimate_full_sequence(
+    series: np.ndarray,
+    d: int,
+    h: float,
+    t_filter: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Estimate rho(t/T) and compute residuals at every t/T, matching the
+    second code's est_theta_general vectorised loop.
+
+    Returns
+    -------
+    rho_seq  : shape (T-d, d+1)  — rho(t/T) for t = d, ..., T-1
+    resid_seq: shape (T-d,)      — L_t - X_{t-1}' rho(t/T)
+    """
+    Y, X = _build_ar_design(series, d)
+    n = len(Y)
+    T = len(series)
+    fracs = np.arange(d, T) / T
+
+    rho_seq = np.empty((n, d + 1))
+    for i in range(n):
+        t_frac = fracs[i]
+        beta, _, _ = local_linear_ar_fit(
+            series, d, h, target_frac=t_frac, t_filter=t_filter
+        )
+        rho_seq[i] = beta
+
+    resid_seq = Y - np.sum(X * rho_seq, axis=1)
+    return rho_seq, resid_seq
+
+
 def local_predict_mean(series: np.ndarray, d: int, h: float) -> float:
     """
-    One-step-ahead conditional mean forecast from local AR(d).
+    One-step-ahead conditional mean forecast from local linear AR(d).
     Localises at the boundary (target_frac = 1.0).
+
+    Returns X_T' @ rho_hat(1) where X_T = [1, L_T, ..., L_{T-d+1}].
     """
-    if d == 0:
-        beta, _, _ = local_linear_ar_fit(series, 0, h, target_frac=1.0)
-        return float(beta[0])
     beta, _, _ = local_linear_ar_fit(series, d, h, target_frac=1.0)
     x_new = np.ones(d + 1)
     for k in range(1, d + 1):
@@ -172,20 +233,39 @@ def local_predict_scale(
     h2: float,
 ) -> float:
     """
-    Local scale (std-dev) estimate from second-stage kernel regression
-    on squared residuals of the first-stage local AR(d).
+    Local scale (std-dev) estimate at u=1 from second-stage local linear
+    kernel regression on squared residuals of the first-stage local AR(d).
+
+    Computes residuals xi_t = L_t - X_{t-1}' rho_hat(t/T) for each t
+    using the time-appropriate coefficient, matching est_theta_general
+    in the second code. Then runs local linear regression of xi_t^2 on
+    rescaled time, evaluated at u=1.
     """
-    beta, resid, _ = local_linear_ar_fit(series, d, h1, target_frac=1.0)
-    sq_resid = resid ** 2
-    # second stage: local constant regression of sq_resid
-    n = len(sq_resid)
-    fracs = (np.arange(d, d + n) + 1) / (d + n)
-    u = (fracs - 1.0) / max(h2, EPS)
-    W2 = epanechnikov_kernel(u)
-    denom = W2.sum()
-    if denom < EPS:
-        return float(np.sqrt(np.mean(sq_resid) + EPS))
-    var_est = (W2 * sq_resid).sum() / denom
+    T = len(series)
+    n = T - d
+
+    # --- stage 1: time-varying residuals using rho(t/T) at each t ---
+    _, resid_seq = _estimate_full_sequence(series, d, h1)
+    sq_resid = resid_seq ** 2
+
+    # --- stage 2: local linear regression of sq_resid on rescaled time ---
+    # F_t(u) = [1, t/T - u], evaluated at u = 1
+    fracs = np.arange(d, T) / T
+    u2 = (fracs - 1.0) / max(h2, EPS)
+    W2 = epanechnikov_kernel(u2)
+
+    delta2 = (fracs - 1.0)[:, None]
+    F = np.hstack([np.ones((n, 1)), delta2])   # shape (n, 2)
+    FW = F * W2[:, None]
+    FWF = FW.T @ F
+    FWsq = FW.T @ sq_resid
+
+    try:
+        varsigma = np.linalg.solve(FWF, FWsq)
+        var_est = float(varsigma[0])           # first component = sigma^2(1)
+    except np.linalg.LinAlgError:
+        var_est = float(np.mean(sq_resid))
+
     return float(np.sqrt(max(var_est, EPS)))
 
 
@@ -195,29 +275,56 @@ def bic_lag_selection(
     series: np.ndarray,
     d_max: int,
     h: float,
+    correct_bic: bool = False,
 ) -> int:
     """
-    Select AR lag order d in {0,...,d_max} via BIC evaluated at
-    the boundary using local kernel weights.
+    Select AR lag order d in {0,...,d_max} via BIC.
+
+    Parameters
+    ----------
+    series      : 1-d array of length T
+    d_max       : maximum lag order to consider
+    h           : preliminary bandwidth for estimation
+    correct_bic : if True, uses the paper's BIC formulation (eq. 7):
+                      BIC(d) = sum_t log(sigma^2(t/T)) + (d+1)*log(T-d)
+                  if False (default), uses the original approximate formulation.
+
+    Returns
+    -------
+    best_d : int
     """
     T = len(series)
     best_d = 0
     best_bic = np.inf
+
     for d in range(0, d_max + 1):
         if T <= d + 2:
             continue
-        beta, resid, W_diag = local_linear_ar_fit(series, d, h, target_frac=1.0)
-        n_eff = W_diag.sum()
-        if n_eff < d + 2:
-            continue
-        sse = (W_diag * resid ** 2).sum()
-        sigma2 = sse / max(n_eff, EPS)
-        if sigma2 <= 0:
-            continue
-        bic = np.log(sigma2 + EPS) + (d + 1) * np.log(max(n_eff, 2)) / max(n_eff, 1)
+
+        if correct_bic:
+            # paper's BIC (eq. 7): sum over t of log(sigma^2(t/T)) + (d+1)*log(T-d)
+            # use time-varying residuals at each t/T then take as sigma^2(t/T) estimate
+            _, resid_seq = _estimate_full_sequence(series, d, h)
+            sigma2_seq = np.maximum(resid_seq ** 2, EPS)
+            bic = np.sum(np.log(sigma2_seq)) + (d + 1) * np.log(T - d)
+        else:
+            # original approximate formulation
+            beta, resid, W_diag = local_linear_ar_fit(
+                series, d, h, target_frac=1.0
+            )
+            n_eff = W_diag.sum()
+            if n_eff < d + 2:
+                continue
+            sse = (W_diag * resid ** 2).sum()
+            sigma2 = sse / max(n_eff, EPS)
+            if sigma2 <= 0:
+                continue
+            bic = np.log(sigma2 + EPS) + (d + 1) * np.log(max(n_eff, 2)) / max(n_eff, 1)
+
         if bic < best_bic:
             best_bic = bic
             best_d = d
+
     return best_d
 
 
@@ -227,46 +334,62 @@ def cv_bandwidth_selection(
     series: np.ndarray,
     d: int,
     h_grid: np.ndarray,
-    n_folds: int = 5,
+    n_folds: int = 20,
 ) -> Tuple[float, np.ndarray]:
     """
-    Blocked cross-validation for bandwidth selection.
+    Interleaved cross-validation for bandwidth selection, matching the
+    paper's fold structure zeta_j = {Q*k + j, k=1,2,...} with Q=n_folds.
 
-    Uses *n_folds* contiguous blocks; each fold is left out in turn.
+    Each held-out observation i is predicted using the model estimated
+    without its fold, evaluated at its own rescaled time u = i/T, exactly
+    matching the second code's h1_CV_calc behaviour.
+
+    CV score is mean of per-fold means, matching np.mean(CV_Q) in the
+    second code.
+
     Returns (best_h, cv_scores).
     """
     T = len(series)
-    if T <= d + 2:
-        return (float(h_grid[len(h_grid) // 2]), np.full(len(h_grid), np.nan))
-
-    indices = np.arange(d, T)
-    block_size = max(len(indices) // n_folds, 1)
+    Q = n_folds
     cv_scores = np.full(len(h_grid), np.nan)
 
+    if T <= d + 2:
+        return float(h_grid[len(h_grid) // 2]), cv_scores
+
+    Y_full, X_full = _build_ar_design(series, d)
+    n = len(Y_full)  # T - d
+
     for ih, h in enumerate(h_grid):
-        total_err = 0.0
-        count = 0
-        for fold in range(n_folds):
-            start = d + fold * block_size
-            end = min(start + block_size, T)
-            if end <= start:
+        fold_mse = np.zeros(Q)
+
+        for j in range(Q):
+            # interleaved fold indices into post-lag rows 0..n-1
+            fold_idx = np.arange(j, n, Q)
+            if len(fold_idx) == 0:
                 continue
-            mask = np.ones(T, dtype=bool)
-            mask[start:end] = False
-            sub_series = series[mask]
-            if len(sub_series) <= d + 2:
-                continue
-            Y_val, X_val = _build_ar_design(series, d)
-            beta_cv, _, _ = local_linear_ar_fit(sub_series, d, h, target_frac=1.0)
-            # evaluate on left-out block
-            for s in range(start - d, end - d):
-                if 0 <= s < len(Y_val):
-                    pred = X_val[s] @ beta_cv
-                    total_err += (Y_val[s] - pred) ** 2
-                    count += 1
-        if count > 0:
-            cv_scores[ih] = total_err / count
-    best_idx = np.nanargmin(cv_scores)
+
+            # t_filter: exclude fold members (original indices fold_idx + d)
+            t_filter = np.ones(T)
+            t_filter[fold_idx + d] = 0.0
+
+            # evaluate at each held-out observation's own rescaled time
+            # matching second code: resid[d:][dj] uses rho(s/T) at each s
+            sq_errors = np.empty(len(fold_idx))
+            for k, idx in enumerate(fold_idx):
+                t_frac = (idx + d) / T
+                beta_cv, _, _ = local_linear_ar_fit(
+                    series, d, h,
+                    target_frac=t_frac,
+                    t_filter=t_filter,
+                )
+                pred = X_full[idx] @ beta_cv
+                sq_errors[k] = (Y_full[idx] - pred) ** 2
+
+            fold_mse[j] = np.mean(sq_errors)
+
+        cv_scores[ih] = np.mean(fold_mse)   # mean of fold means, matching second code
+
+    best_idx = int(np.nanargmin(cv_scores))
     return float(h_grid[best_idx]), cv_scores
 
 
@@ -299,46 +422,58 @@ def predict_pairwise_ld(
     fixed_d: Optional[int] = None,
     fixed_h1: Optional[float] = None,
     fixed_h2: Optional[float] = None,
-    n_cv_folds: int = 5,
+    n_cv_folds: int = 20,
+    correct_bic: bool = False,
 ) -> PairwiseLDResult:
     """
-    Given a history of pairwise loss differentials (up to time t),
+    Given a history of pairwise loss differentials (up to time T),
     produce next-period conditional mean and scale estimates.
+
+    Parameters
+    ----------
+    delta_L     : 1-d array of loss differences L_t = Loss_A - Loss_B
+    d_max       : maximum lag order for BIC selection
+    h1_grid     : bandwidth grid for first-stage CV (default: log-spaced)
+    h2_grid     : bandwidth grid for second-stage CV (default: log-spaced)
+    fixed_d     : fix lag order, bypassing BIC selection
+    fixed_h1    : fix first-stage bandwidth, bypassing CV
+    fixed_h2    : fix second-stage bandwidth, bypassing CV
+    n_cv_folds  : number of interleaved CV folds (paper recommends Q>=20)
+    correct_bic : if True use paper's BIC formulation; if False use
+                  approximate formulation (default False)
+
+    Returns
+    -------
+    PairwiseLDResult with mu_hat, sigma_hat, and selected d, h1, h2
     """
     T = len(delta_L)
     if T < 5:
-        return PairwiseLDResult()  # too short
+        return PairwiseLDResult()
 
     if h1_grid is None:
         h1_grid = make_h_grid(12, 0.05, 1.0)
     if h2_grid is None:
         h2_grid = make_h_grid(10, 0.10, 1.0)
 
-    # preliminary bandwidth for BIC
     h_prelim = float(h1_grid[len(h1_grid) // 2])
 
     # lag selection
     if fixed_d is not None:
         d = fixed_d
     else:
-        d = bic_lag_selection(delta_L, d_max, h_prelim)
+        d = bic_lag_selection(delta_L, d_max, h_prelim, correct_bic=correct_bic)
 
-    # bandwidth selection h1
+    # bandwidth h1
     if fixed_h1 is not None:
         h1 = fixed_h1
     else:
         h1, _ = cv_bandwidth_selection(delta_L, d, h1_grid, n_cv_folds)
 
-    # re-select d at chosen h1
-    if fixed_d is None:
-        d = bic_lag_selection(delta_L, d_max, h1)
-
-    # bandwidth selection h2
+    # bandwidth h2
     if fixed_h2 is not None:
         h2 = fixed_h2
     else:
-        # simple choice: use h2 moderately larger than h1
-        h2 = min(h1 * 1.5, 1.0)
+        h2, _ = cv_bandwidth_selection(delta_L, d, h2_grid, n_cv_folds)
 
     mu = local_predict_mean(delta_L, d, h1)
     sigma = local_predict_scale(delta_L, d, h1, h2)
