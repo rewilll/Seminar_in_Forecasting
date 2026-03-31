@@ -1663,11 +1663,9 @@ def run_backtest(
 
         # --- LAYER 1: Pairwise LD predictions ---
         mu_mat = np.zeros((M, M))
-        sigma_mat = np.ones((M, M))
+        sigma_mat = np.zeros((M, M))
         for i in range(M):
-            for j in range(M):
-                if i == j:
-                    continue
+            for j in range(i+1, M):
                 dl_hist = delta_L_full[i, j, :hist_end]
                 if len(dl_hist) < bt_cfg.min_history:
                     continue
@@ -1680,7 +1678,9 @@ def run_backtest(
                     n_cv_folds=bt_cfg.n_cv_folds,
                 )
                 mu_mat[i, j] = pld.mu_hat
+                mu_mat[j, i] = -pld.mu_hat
                 sigma_mat[i, j] = pld.sigma_hat
+                sigma_mat[j, i] = pld.sigma_hat
 
         res.mu_matrices.append(mu_mat.copy())
         res.sigma_matrices.append(sigma_mat.copy())
