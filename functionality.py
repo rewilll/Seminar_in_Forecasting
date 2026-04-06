@@ -713,7 +713,7 @@ def graph_only_weights(r: np.ndarray) -> np.ndarray:
     w = np.maximum(r, 0.0)
     s = w.sum()
     if s < EPS:
-        return np.ones(len(r)) / len(r)
+        raise "error in graph_only_weights: s < EPS"
     return w / s
 
 
@@ -754,16 +754,9 @@ def _solve_combination_qp(
     """Core QP solver using scipy."""
     wbar = np.ones(M) / M
 
-    # Q = Sigma + gamma * I
+    # f(w) = w' Sigma w - alpha r'w + gamma ||w-wbar||^2
+    #      = w' (Sigma + gamma I) w - (alpha r + 2 gamma wbar)' w + const
     Q = Sigma + gamma * np.eye(M)
-    # linear term: -alpha * r + (-2*gamma * wbar handled via expansion)
-    # objective: 0.5 * w'(2Q)w + c'w
-    # but we write: min w'Q w - alpha r'w + gamma w'w - 2gamma wbar'w + gamma wbar'wbar
-    # = w' (Sigma + gamma I) w  - (alpha r + 2 gamma wbar)'w + const
-    # Actually let's be precise:
-    # f(w) = w' Sigma w - alpha r'w + gamma (w-wbar)'(w-wbar)
-    #       = w' Sigma w - alpha r'w + gamma w'w - 2 gamma wbar'w + gamma wbar'wbar
-    #       = w' (Sigma + gamma I) w - (alpha r + 2 gamma wbar)' w + const
     c = -(alpha * r + 2.0 * gamma * wbar)
 
     def objective(w):
@@ -889,6 +882,149 @@ def rs_selection_weights(
     w = np.zeros(M)
     w[np.argmax(wins)] = 1.0
     return w
+
+
+def _fit_var_ols(
+    panel: np.ndarray,
+    lags: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Fit a VAR(lags) with intercept by equation-wise OLS on a multivariate panel.
+
+    Parameters
+    ----------
+    panel : array of shape (T, M)
+        Multivariate time series.
+    lags : int
+        Number of VAR lags.
+
+    Returns
+    -------
+    coef : array of shape (1 + M * lags, M)
+        OLS coefficient matrix.
+    resid : array of shape (T-lags, M)
+        In-sample residuals.
+    last_state : array of shape (1 + M * lags,)
+        Regressor vector for the next one-step-ahead forecast.
+    """
+    T, M = panel.shape
+    if T <= lags:
+        raise ValueError("Not enough observations for VAR({})".format(lags))
+
+    Y = panel[lags:]
+    X = np.ones((T - lags, 1 + M * lags))
+    for ell in range(1, lags + 1):
+        start = 1 + (ell - 1) * M
+        stop = start + M
+        X[:, start:stop] = panel[lags - ell:T - ell]
+
+    coef, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)
+    resid = Y - X @ coef
+
+    last_state = np.ones(1 + M * lags)
+    for ell in range(1, lags + 1):
+        start = 1 + (ell - 1) * M
+        stop = start + M
+        last_state[start:stop] = panel[-ell]
+
+    return coef, resid, last_state
+
+
+def _select_var_lag(
+    panel: np.ndarray,
+    max_lags: int = 3,
+    ic: Literal["bic", "aic"] = "bic",
+) -> int:
+    """
+    Select a VAR lag order using a simple multivariate AIC/BIC criterion.
+    """
+    T, M = panel.shape
+    best_lag = 0
+    best_score = np.inf
+
+    max_feasible = min(int(max_lags), max(T - 2, 0))
+    for lags in range(0, max_feasible + 1):
+        try:
+            coef, resid, _ = _fit_var_ols(panel, lags)
+        except ValueError:
+            continue
+
+        n_obs = resid.shape[0]
+        if n_obs <= 0:
+            continue
+
+        Sigma_hat = (resid.T @ resid) / max(n_obs, 1)
+        Sigma_hat = regularise_cov(Sigma_hat, ridge=RIDGE_COV)
+        sign, logdet = np.linalg.slogdet(Sigma_hat)
+        if sign <= 0:
+            continue
+
+        n_params = coef.size
+        if ic == "aic":
+            score = logdet + 2.0 * n_params / max(n_obs, 1)
+        else:
+            score = logdet + np.log(max(n_obs, 2)) * n_params / max(n_obs, 1)
+
+        if score < best_score:
+            best_score = score
+            best_lag = lags
+
+    return best_lag
+
+
+def var_error_weights(
+    errors: np.ndarray,
+    max_lags: int = 3,
+    fixed_lag: Optional[int] = None,
+    window: int = 60,
+    ic: Literal["bic", "aic"] = "bic",
+    ridge: float = RIDGE_COV,
+) -> Tuple[np.ndarray, int, np.ndarray, np.ndarray]:
+    """
+    Weight-based benchmark built from a VAR model for the forecast-error panel.
+
+    The VAR provides a one-step-ahead conditional mean forecast for the vector
+    of model errors along with an innovation covariance estimate. Under squared
+    loss, the conditional second moment of the combined error is
+
+        E[(w'e_{t+1})^2 | F_t] = w' (Sigma_u + mu_e mu_e') w,
+
+    so the benchmark chooses simplex weights that minimise this quantity.
+
+    Returns
+    -------
+    weights : array of shape (M,)
+        Simplex-constrained weights implied by the VAR error forecast.
+    selected_lag : int
+        VAR lag order used for the one-step-ahead error forecast.
+    err_forecast : array of shape (M,)
+        One-step-ahead conditional mean error forecast.
+    second_moment : array of shape (M, M)
+        Conditional second-moment matrix Sigma_u + mu_e mu_e'.
+    """
+    T_hist, M = errors.shape
+    if T_hist == 0:
+        w_eq = equal_weights(M)
+        return w_eq, 0, np.zeros(M), np.eye(M)
+
+    use = errors[max(0, T_hist - window):T_hist]
+    max_lags = min(int(max_lags), max(len(use) - 2, 0))
+
+    if fixed_lag is not None:
+        lags = min(int(fixed_lag), max_lags)
+    else:
+        lags = _select_var_lag(use, max_lags=max_lags, ic=ic)
+
+    coef, resid, last_state = _fit_var_ols(use, lags)
+    err_forecast = last_state @ coef
+
+    n_obs = resid.shape[0]
+    Sigma_u = (resid.T @ resid) / max(n_obs, 1)
+    Sigma_u = regularise_cov(Sigma_u, ridge=ridge)
+
+    second_moment = Sigma_u + np.outer(err_forecast, err_forecast)
+    weights = covariance_only_weights(second_moment, ridge=ridge)
+    return weights, lags, err_forecast, second_moment
 
 
 # ===================================================================
@@ -1520,8 +1656,8 @@ class BacktestConfig:
     ridge_cov: float = RIDGE_COV
 
     # optimisation
-    alpha: Optional[float] = None  # None => tune
-    gamma: Optional[float] = None  # None => tune
+    alpha: Optional[float] = None  # None => tune; graph reward strength
+    gamma: Optional[float] = None  # None => tune; equal-weight shrinkage
     alpha_grid: Optional[np.ndarray] = None
     gamma_grid: Optional[np.ndarray] = None
     tune_window: int = 40  # rolling window for tuning alpha, gamma
@@ -1532,6 +1668,10 @@ class BacktestConfig:
     # benchmarks
     recent_best_window: int = 20
     bg_window: int = 60
+    var_window: int = 60
+    var_max_lags: int = 3
+    var_fixed_lag: Optional[int] = None
+    var_ic: Literal["bic", "aic"] = "bic"
 
     # misc
     min_history: int = 30  # minimum observations before producing weights
@@ -1557,6 +1697,7 @@ class BacktestResult:
     cov_matrices: Optional[List] = None
     alpha_selected: Optional[np.ndarray] = None
     gamma_selected: Optional[np.ndarray] = None
+    var_lag_selected: Optional[np.ndarray] = None
     d_selected: Optional[List] = None
 
 
@@ -1607,6 +1748,7 @@ def run_backtest(
         cov_matrices=[],
         alpha_selected=np.zeros(n_oos),
         gamma_selected=np.zeros(n_oos),
+        var_lag_selected=np.zeros(n_oos, dtype=int),
     )
 
     # Method names
@@ -1616,6 +1758,7 @@ def run_backtest(
         "recent_best",
         "bates_granger",
         "bates_granger_mv",
+        "var_error",
         "rs_selection",
         "graph_only",
         "cov_only",
@@ -1748,9 +1891,21 @@ def run_backtest(
         w_bg = bates_granger_weights(errors_hist, bt_cfg.bg_window)
         res.weights["bates_granger"][oos_idx] = w_bg
 
-        # 5. Bates–Granger MV
+        # 5. Bates-Granger MV
         w_bgmv = bates_granger_mv_weights(errors_hist, bt_cfg.bg_window)
         res.weights["bates_granger_mv"][oos_idx] = w_bgmv
+
+        # 6. VAR benchmark on forecast errors
+        w_var, var_lags, _, _ = var_error_weights(
+            errors_hist,
+            max_lags=bt_cfg.var_max_lags,
+            fixed_lag=bt_cfg.var_fixed_lag,
+            window=bt_cfg.var_window,
+            ic=bt_cfg.var_ic,
+            ridge=bt_cfg.ridge_cov,
+        )
+        res.var_lag_selected[oos_idx] = var_lags
+        res.weights["var_error"][oos_idx] = w_var
 
         # 6. RS selection
         w_rs = rs_selection_weights(mu_mat)
@@ -3357,50 +3512,6 @@ def document_simulations() -> pd.DataFrame:
     ]
     return pd.DataFrame(rows)
 
-
-def showcase_model_diagnostics(
-    data: SimulationData,
-    res: BacktestResult,
-    mcs_alpha: float = 0.10,
-    mcs_B: int = 500,
-    mcs_statistic: Literal["Tmax", "TR"] = "Tmax",
-    adaptability_horizon: int = 40,
-    adaptability_window: int = 5,
-) -> Dict[str, object]:
-    """Convenience wrapper that returns the main tables and plots for comparison."""
-    mcs = model_confidence_set(
-        res,
-        alpha=mcs_alpha,
-        B=mcs_B,
-        statistic=mcs_statistic,
-    )
-    mcs_table = compute_mcs_performance_table(res, mcs_result=mcs)
-    mcs_fig = plot_mcs_summary(res, mcs_result=mcs)
-
-    adaptability = compute_adaptability_diagnostics(
-        data,
-        res,
-        horizon=adaptability_horizon,
-        smooth_window=adaptability_window,
-    )
-    adaptability_fig = plot_adaptability_event_study(adaptability)
-    adaptability_half_life_fig = plot_adaptability_half_life(adaptability)
-
-    return {
-        "simulation_doc": document_simulations(),
-        "mcs_doc": document_mcs_procedure(),
-        "adaptability_doc": document_adaptability_measure(),
-        "references": methodology_references(),
-        "mcs_result": mcs,
-        "mcs_table": mcs_table,
-        "mcs_figure": mcs_fig,
-        "adaptability_result": adaptability,
-        "adaptability_table": adaptability.summary_table,
-        "adaptability_figure": adaptability_fig,
-        "adaptability_half_life_figure": adaptability_half_life_fig,
-    }
-
-
 # ===================================================================
 # 12.  EMPIRICAL INFLATION EVALUATION
 # ===================================================================
@@ -3412,10 +3523,11 @@ class EmpiricalStudyResult:
     """
     Store empirical data inputs, backtest outputs, and reporting tables.
 
-    The object is designed for direct inspection after running the empirical
-    next-quarter inflation exercise on the survey forecasts in `Empirical_Data`.
+    The object is designed for direct inspection after running an empirical
+    out-of-sample study on a survey forecast panel in `Empirical_Data`.
     """
     dataset_name: str
+    dataset_label: str
     merged_data: pd.DataFrame
     forecaster_ids: List[str]
     training_periods: int
@@ -3430,23 +3542,26 @@ class EmpiricalStudyResult:
 
 # ---------- Empirical data preparation ----------
 
-def load_empirical_inflation_data(
-    forecast_path: str = "Empirical_Data/inflation_forecasts_f.csv",
-    truth_path: str = "Empirical_Data/inflation_truth_f.csv",
+def load_empirical_data(
+    forecast_path: str,
+    truth_path: str,
+    dataset_name: str = "empirical_panel",
     training_periods: int = 20,
     loss_name: str = "squared",
 ) -> Tuple[SimulationData, pd.DataFrame, List[str]]:
     """
-    Load and align the empirical next-quarter inflation forecast panel.
+    Load and align an empirical forecast panel.
 
-    The empirical files are assumed to be clean, aligned, and already ordered
-    chronologically. The loader therefore keeps the input structure simple and
-    converts the two CSVs directly into the `SimulationData` container used by
-    the backtest engine.
+    The forecast file is expected to be a wide `T x M` matrix with a
+    `TARGET_PERIOD` column and one column per forecaster. The truth file is
+    expected to contain `TARGET_PERIOD` and `actual`. The loader aligns the two
+    sources by target period, sorts them chronologically, and converts the
+    merged panel into the `SimulationData` container used by the backtest.
 
     Args:
         forecast_path (str): Path to the `T x M` forecast matrix CSV
-        truth_path (str): Path to the realized inflation CSV
+        truth_path (str): Path to the realized target CSV
+        dataset_name (str): Name stored in the resulting simulation config
         training_periods (int): First OOS index
         loss_name (str): Loss function used to construct empirical losses
 
@@ -3460,11 +3575,16 @@ def load_empirical_inflation_data(
     forecasts_df = pd.read_csv(forecast_path)
     truth_df = pd.read_csv(truth_path)
     forecaster_ids = [col for col in forecasts_df.columns if col != "TARGET_PERIOD"]
-    merged = forecasts_df.copy()
-    merged["actual"] = truth_df["actual"].to_numpy()
+    merged = forecasts_df.merge(
+        truth_df[["TARGET_PERIOD", "actual"]],
+        on="TARGET_PERIOD",
+        how="left",
+    )
     merged["period_dt"] = pd.to_datetime(merged["TARGET_PERIOD"])
+    merged = merged.sort_values("period_dt").reset_index(drop=True)
     numeric_cols = forecaster_ids + ["actual"]
     merged[numeric_cols] = merged[numeric_cols].astype(float)
+    merged = merged.dropna(subset=["actual"]).reset_index(drop=True)
 
     T = len(merged)
     M = len(forecaster_ids)
@@ -3475,7 +3595,7 @@ def load_empirical_inflation_data(
     losses = loss_fn(y[:, None], forecasts)
 
     cfg = ScenarioConfig(
-        name="empirical_inflation_next_quarter",
+        name=dataset_name,
         M=M,
         T=T,
         T0=training_periods,
@@ -3495,9 +3615,24 @@ def load_empirical_inflation_data(
     return data, merged, forecaster_ids
 
 
+def load_empirical_inflation_data(
+    forecast_path: str = "Empirical_Data/inflation_forecasts_f.csv",
+    truth_path: str = "Empirical_Data/inflation_truth_f.csv",
+    training_periods: int = 20,
+    loss_name: str = "squared",
+) -> Tuple[SimulationData, pd.DataFrame, List[str]]:
+    """Backward-compatible wrapper for the inflation panel."""
+    return load_empirical_data(
+        forecast_path=forecast_path,
+        truth_path=truth_path,
+        dataset_name="empirical_inflation_next_quarter",
+        training_periods=training_periods,
+        loss_name=loss_name,
+    )
+
 def _default_empirical_bt_config(training_periods: int = 20) -> BacktestConfig:
     """
-    Build a stable backtest configuration for the empirical inflation study.
+    Build a stable backtest configuration for an empirical study.
 
     Args:
         training_periods (int): Minimum amount of historical data available
@@ -3519,14 +3654,14 @@ def _default_empirical_bt_config(training_periods: int = 20) -> BacktestConfig:
 
 def _select_empirical_comparison_methods(
     performance_table: pd.DataFrame,
-    max_methods: int = 6,
+    max_methods: Optional[int] = None,
 ) -> List[str]:
     """
-    Pick a readable comparison set anchored on `full_gcsr`.
+    Pick an ordered empirical comparison set anchored on `full_gcsr`.
 
     Args:
         performance_table (pd.DataFrame): Method-level performance summary
-        max_methods (int): Maximum number of methods to keep in the plot set
+        max_methods (int | None): Optional maximum number of methods to keep
 
     Returns:
         List[str]: Ordered list of methods for empirical comparison plots
@@ -3534,6 +3669,7 @@ def _select_empirical_comparison_methods(
     preferred = [
         "full_gcsr",
         "bates_granger_mv",
+        "var_error",
         "cov_only",
         "recent_best",
         "graph_only",
@@ -3545,12 +3681,12 @@ def _select_empirical_comparison_methods(
     for name in preferred:
         if name in available and name not in selected:
             selected.append(name)
-        if len(selected) >= max_methods:
+        if max_methods is not None and len(selected) >= max_methods:
             return selected
     for name in available:
         if name not in selected:
             selected.append(name)
-        if len(selected) >= max_methods:
+        if max_methods is not None and len(selected) >= max_methods:
             break
     return selected
 
@@ -3597,16 +3733,42 @@ def run_empirical_inflation_study(
     verbose: bool = False,
 ) -> EmpiricalStudyResult:
     """
-    Run a next-quarter out-of-sample empirical backtest on the inflation panel.
+    Backward-compatible wrapper for the inflation empirical study.
+    """
+    return run_empirical_study(
+        forecast_path=forecast_path,
+        truth_path=truth_path,
+        dataset_name="empirical_inflation_next_quarter",
+        dataset_label="Inflation",
+        training_periods=training_periods,
+        bt_cfg=bt_cfg,
+        mcs_alpha=mcs_alpha,
+        mcs_B=mcs_B,
+        mcs_statistic=mcs_statistic,
+        verbose=verbose,
+    )
 
-    The exercise treats each row as a forecast for the next target quarter,
-    starts evaluation after `training_periods` observations, and compares the
-    full GCSR method with the benchmark combination rules already defined in
-    this module.
+
+def run_empirical_study(
+    forecast_path: str,
+    truth_path: str,
+    dataset_name: str = "empirical_panel",
+    dataset_label: Optional[str] = None,
+    training_periods: int = 20,
+    bt_cfg: Optional[BacktestConfig] = None,
+    mcs_alpha: float = 0.10,
+    mcs_B: int = 500,
+    mcs_statistic: Literal["Tmax", "TR"] = "Tmax",
+    verbose: bool = False,
+) -> EmpiricalStudyResult:
+    """
+    Run a generic out-of-sample empirical backtest on a wide forecast panel.
 
     Args:
         forecast_path (str): Path to the empirical forecast CSV
-        truth_path (str): Path to the realized inflation CSV
+        truth_path (str): Path to the realized target CSV
+        dataset_name (str): Internal dataset identifier
+        dataset_label (str | None): Human-readable label used in plots/tables
         training_periods (int): In-sample history available before OOS testing
         bt_cfg (BacktestConfig | None): Optional empirical backtest configuration
         mcs_alpha (float): Model Confidence Set significance level
@@ -3617,9 +3779,13 @@ def run_empirical_inflation_study(
     Returns:
         EmpiricalStudyResult: Empirical data, backtest output, and summary tables
     """
-    data, merged, forecaster_ids = load_empirical_inflation_data(
+    if dataset_label is None:
+        dataset_label = dataset_name.replace("_", " ").title()
+
+    data, merged, forecaster_ids = load_empirical_data(
         forecast_path=forecast_path,
         truth_path=truth_path,
+        dataset_name=dataset_name,
         training_periods=training_periods,
     )
 
@@ -3640,7 +3806,8 @@ def run_empirical_inflation_study(
     mcs_table = compute_mcs_performance_table(res, mcs_result=mcs_result)
 
     study = EmpiricalStudyResult(
-        dataset_name="empirical_inflation_next_quarter",
+        dataset_name=dataset_name,
+        dataset_label=dataset_label,
         merged_data=merged,
         forecaster_ids=forecaster_ids,
         training_periods=training_periods,
@@ -3663,7 +3830,7 @@ def plot_empirical_oos_forecasts(
     ax=None,
 ):
     """
-    Plot realized inflation against combined next-quarter OOS forecasts.
+    Plot realized target values against combined OOS forecasts.
 
     Args:
         study (EmpiricalStudyResult): Empirical study output
@@ -3691,9 +3858,9 @@ def plot_empirical_oos_forecasts(
             color="darkred" if is_gcsr else None,
             zorder=3 if is_gcsr else 2,
         )
-    ax.set_title("Empirical Next-Quarter Inflation Forecasts")
-    ax.set_xlabel("Target Quarter")
-    ax.set_ylabel("Inflation")
+    ax.set_title(f"{study.dataset_label} OOS Forecasts")
+    ax.set_xlabel("Target Period")
+    ax.set_ylabel(study.dataset_label)
     ax.legend(fontsize=8, ncol=2)
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -3720,7 +3887,7 @@ def plot_empirical_cumulative_loss(
         methods = study.comparison_methods
     fig = plot_cumulative_loss(study.backtest, methods=list(methods), reference=reference)
     ax = fig.axes[0]
-    ax.set_title("Empirical Cumulative Loss Difference")
+    ax.set_title(f"{study.dataset_label} Cumulative Loss Difference")
     ax.set_xlabel("OOS Index")
     return fig
 
@@ -3740,7 +3907,7 @@ def plot_empirical_weight_comparison(
         matplotlib.figure.Figure: Figure containing the weight time series
     """
     if methods is None:
-        methods = ["full_gcsr", "cov_only", "graph_only", "bates_granger_mv"]
+        methods = [m for m in study.backtest.weights if m != "median"]
     methods = [m for m in methods if m in study.backtest.weights]
     return plot_weight_timeseries(study.backtest, methods=methods)
 
@@ -3756,24 +3923,42 @@ def showcase_empirical_inflation_study(
     verbose: bool = False,
 ) -> Dict[str, object]:
     """
-    Run the empirical inflation study and return the main tables and plots.
-
-    Args:
-        forecast_path (str): Path to the empirical forecast CSV
-        truth_path (str): Path to the realized inflation CSV
-        training_periods (int): Number of initial periods reserved for training
-        bt_cfg (BacktestConfig | None): Optional backtest configuration
-        mcs_alpha (float): Model Confidence Set significance level
-        mcs_B (int): Number of MCS bootstrap resamples
-        mcs_statistic (Literal["Tmax", "TR"]): MCS test statistic
-        verbose (bool): Whether to print rolling backtest progress
-
-    Returns:
-        Dict[str, object]: Empirical study object plus comparison tables and figures
+    Backward-compatible wrapper for the inflation showcase helper.
     """
-    study = run_empirical_inflation_study(
+    return showcase_empirical_study(
         forecast_path=forecast_path,
         truth_path=truth_path,
+        dataset_name="empirical_inflation_next_quarter",
+        dataset_label="Inflation",
+        training_periods=training_periods,
+        bt_cfg=bt_cfg,
+        mcs_alpha=mcs_alpha,
+        mcs_B=mcs_B,
+        mcs_statistic=mcs_statistic,
+        verbose=verbose,
+    )
+
+
+def showcase_empirical_study(
+    forecast_path: str,
+    truth_path: str,
+    dataset_name: str = "empirical_panel",
+    dataset_label: Optional[str] = None,
+    training_periods: int = 20,
+    bt_cfg: Optional[BacktestConfig] = None,
+    mcs_alpha: float = 0.10,
+    mcs_B: int = 500,
+    mcs_statistic: Literal["Tmax", "TR"] = "Tmax",
+    verbose: bool = False,
+) -> Dict[str, object]:
+    """
+    Run a generic empirical study and return the main tables and plots.
+    """
+    study = run_empirical_study(
+        forecast_path=forecast_path,
+        truth_path=truth_path,
+        dataset_name=dataset_name,
+        dataset_label=dataset_label,
         training_periods=training_periods,
         bt_cfg=bt_cfg,
         mcs_alpha=mcs_alpha,
@@ -3886,26 +4071,26 @@ def print_timing_rules():
     """Print the information set / timing conventions."""
     text = """
     ╔══════════════════════════════════════════════════════════════════╗
-    ║                    TIMING CONVENTIONS                          ║
+    ║                    TIMING CONVENTIONS                            ║
     ╠══════════════════════════════════════════════════════════════════╣
-    ║                                                                ║
-    ║  Forecast origin: t                                            ║
-    ║  Target to predict: y_{t}                                      ║
-    ║  Forecasts available: f_{j,t} for j=1,...,M                    ║
-    ║  Realised outcomes available: y_0, ..., y_{t-1}                ║
-    ║  Realised losses available: L_{j,0}, ..., L_{j,t-1}           ║
-    ║  Realised errors available: e_{j,0}, ..., e_{j,t-1}           ║
-    ║                                                                ║
-    ║  Weights w_{t} are formed using ONLY:                          ║
-    ║    - losses / errors from periods 0 through t-1                ║
-    ║    - pairwise LD from periods 0 through t-1                    ║
-    ║    - covariance from errors 0 through t-1                      ║
-    ║                                                                ║
-    ║  y_{t} is NEVER used when forming w_{t}.                       ║
-    ║                                                                ║
-    ║  Combined forecast: ŷ_t = Σ_j w_{j,t} f_{j,t}                ║
-    ║  Evaluated after y_t is realised.                              ║
-    ║                                                                ║
+    ║                                                                  ║
+    ║  Forecast origin: t                                              ║
+    ║  Target to predict: y_{t}                                        ║
+    ║  Forecasts available: f_{j,t} for j=1,...,M                      ║
+    ║  Realised outcomes available: y_0, ..., y_{t-1}                  ║
+    ║  Realised losses available: L_{j,0}, ..., L_{j,t-1}              ║
+    ║  Realised errors available: e_{j,0}, ..., e_{j,t-1}              ║
+    ║                                                                  ║
+    ║  Weights w_{t} are formed using ONLY:                            ║
+    ║    - losses / errors from periods 0 through t-1                  ║
+    ║    - pairwise LD from periods 0 through t-1                      ║
+    ║    - covariance from errors 0 through t-1                        ║
+    ║                                                                  ║
+    ║  y_{t} is NEVER used when forming w_{t}.                         ║
+    ║                                                                  ║
+    ║  Combined forecast: ŷ_t = Σ_j w_{j,t} f_{j,t}                    ║
+    ║  Evaluated after y_t is realised.                                ║
+    ║                                                                  ║
     ╚══════════════════════════════════════════════════════════════════╝
     """
     print(text)
